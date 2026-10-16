@@ -1,0 +1,144 @@
+name: Validate Percona PR 1322 (no deployment)
+
+on:
+  push:
+    branches: [validation/percona-pr-1322]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      HUGO_VERSION: '0.168.0'
+      HUGO_ENVIRONMENT: production
+      TZ: America/Los_Angeles
+      EXPECTED_SOURCE_SHA: b2b1d227e00f24f7e040feb135751123f874cb84
+    steps:
+      - name: Check out the exact submitted PR source
+        uses: actions/checkout@v4
+        with:
+          repository: yananai-chiwuta/community
+          ref: b2b1d227e00f24f7e040feb135751123f874cb84
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+      - name: Verify source and record unchanged article and photo
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          mkdir -p "$RUNNER_TEMP/pr1322-validation"
+          sha256sum content/blog/2026/2026-10-16-webhook-deduplication-isnt-enough.md assets/contributors/yananai_chiwuta.png > "$RUNNER_TEMP/pr1322-validation/unchanged.sha256"
+          cp content/contributors/yananai_chiwuta.md "$RUNNER_TEMP/pr1322-validation/profile-before.md"
+          git rev-parse HEAD
+      - name: Install Hugo Extended and build dependencies on cloud runner only
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/hugo.deb" "https://github.com/gohugoio/hugo/releases/download/v${HUGO_VERSION}/hugo_extended_${HUGO_VERSION}_linux-amd64.deb"
+          sudo dpkg -i "$RUNNER_TEMP/hugo.deb"
+          npm install -g sass
+          python3 -m venv "$RUNNER_TEMP/pr1322-python"
+          "$RUNNER_TEMP/pr1322-python/bin/python" -m pip install python-frontmatter PyYAML
+          hugo version
+          sass --version
+          "$RUNNER_TEMP/pr1322-python/bin/python" -m pip freeze
+          if [[ -f package-lock.json || -f npm-shrinkwrap.json ]]; then npm ci; fi
+      - name: Run the upstream contributor metadata script
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/pr1322-python/bin/python" tools/contributors/update_contributors.py 2>&1 | tee "$RUNNER_TEMP/pr1322-validation/metadata.log"
+          cp content/contributors/yananai_chiwuta.md "$RUNNER_TEMP/pr1322-validation/profile-generated.md"
+          git diff -- content/contributors/yananai_chiwuta.md | tee "$RUNNER_TEMP/pr1322-validation/profile.diff"
+          git restore -- content/contributors
+          cp "$RUNNER_TEMP/pr1322-validation/profile-generated.md" content/contributors/yananai_chiwuta.md
+          "$RUNNER_TEMP/pr1322-python/bin/python" - <<'PY'
+          import frontmatter, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'pr1322-validation'
+          before = frontmatter.load(root / 'profile-before.md')
+          after = frontmatter.load(root / 'profile-generated.md')
+          assert before.content == after.content, 'Biography changed'
+          for key, value in before.metadata.items():
+              assert after[key] == value, f'Manual profile field changed: {key}'
+          assert after['posts_count'] == 1
+          assert after['events_count'] == after['talks_count'] == 0
+          assert after['contributor_type'] == ['author']
+          assert after['contributor_year'] == ['2026']
+          assert after['contributor_tag'] == ['PostgreSQL']
+          assert set(after['blog_tags']) == {'PostgreSQL', 'Webhooks', 'CRM', 'Concurrency'}
+          print('=== GENERATED CONTRIBUTOR CARD ===')
+          print((root / 'profile-generated.md').read_text())
+          print('=== END GENERATED CONTRIBUTOR CARD ===')
+          PY
+      - name: Build the site with drafts included (never deploy)
+        run: |
+          set -euo pipefail
+          hugo --gc --minify --buildDrafts --baseURL 'https://percona.community/' --cacheDir "$RUNNER_TEMP/hugo_cache" --destination "$RUNNER_TEMP/pr1322-site" 2>&1 | tee "$RUNNER_TEMP/pr1322-validation/hugo.log"
+      - name: Verify the rendered article and author page
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/pr1322-python/bin/python" - <<'PY'
+          import json, os
+          from html.parser import HTMLParser
+          from pathlib import Path
+          from urllib.parse import urlsplit, unquote
+          class Page(HTMLParser):
+              def __init__(self):
+                  super().__init__(); self.text=[]; self.links=[]; self.images=[]; self.tables=0; self.code=0
+              def handle_data(self, data): self.text.append(data)
+              def handle_starttag(self, tag, attrs):
+                  a=dict(attrs)
+                  if tag=='a': self.links.append(a.get('href',''))
+                  if tag=='img': self.images.append(a.get('src',''))
+                  if tag=='table': self.tables+=1
+                  if tag=='code': self.code+=1
+          site=Path(os.environ['RUNNER_TEMP'])/'pr1322-site'
+          post=site/'blog/2026/10/16/webhook-deduplication-isnt-enough/index.html'
+          author=site/'contributors/yananai_chiwuta/index.html'
+          assert post.is_file(), 'Draft article was not rendered'
+          assert author.is_file(), 'Contributor page was not rendered'
+          article=Page(); article.feed(post.read_text())
+          profile=Page(); profile.feed(author.read_text())
+          text=' '.join(article.text).replace('’', "'")
+          assert "Why Webhook Deduplication Isn't Enough" in text
+          assert 'Running it on Percona Distribution for PostgreSQL 18' in text
+          assert article.tables >= 6, 'Expected article tables missing'
+          assert article.code >= 4, 'Expected SQL/code markup missing'
+          assert any('/contributors/yananai_chiwuta/' in u for u in article.links), 'Article author link missing'
+          assert 'https://github.com/yananai-chiwuta/percona-crm-correctness/releases/tag/v1.1.0' in article.links
+          photos=[u for u in profile.images if 'yananai_chiwuta' in u]
+          assert photos, 'Author photograph missing from rendered contributor page'
+          for u in photos:
+              parsed=urlsplit(u)
+              assert not parsed.netloc or parsed.netloc=='percona.community'
+              assert (site/unquote(parsed.path).lstrip('/')).is_file(), f'Rendered photo missing: {u}'
+          report={'tested_sha':os.environ['EXPECTED_SOURCE_SHA'], 'hugo_version':os.environ['HUGO_VERSION'], 'metadata_script':'PASS', 'draft_build':'PASS', 'article_rendered':True, 'author_link':True, 'photo_rendered':True, 'article_tables':article.tables, 'code_elements':article.code, 'deployment':'NOT PERFORMED'}
+          (Path(os.environ['RUNNER_TEMP'])/'pr1322-validation/summary.json').write_text(json.dumps(report,indent=2)+'\n')
+          print(json.dumps(report,indent=2))
+          PY
+          sha256sum --check "$RUNNER_TEMP/pr1322-validation/unchanged.sha256"
+          test "$(git diff --name-only | wc -l)" -eq 1
+          test "$(git diff --name-only)" = content/contributors/yananai_chiwuta.md
+      - name: Preserve results in the Actions summary and logs (no deployment or artifact storage)
+        if: always()
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/pr1322-validation"
+          {
+            echo '# PR 1322 validation'
+            echo "Tested source: $EXPECTED_SOURCE_SHA"
+            echo 'This workflow does not deploy or push any generated files.'
+            if [[ -f "$root/summary.json" ]]; then
+              echo '```json'; cat "$root/summary.json"; echo '```'
+            else
+              echo 'Validation incomplete or failed. Inspect the job steps; no passing build is claimed.'
+            fi
+            if [[ -f "$root/profile-generated.md" ]]; then
+              echo '## Generated contributor card'
+              echo '````yaml'; cat "$root/profile-generated.md"; echo; echo '````'
+              echo '## Contributor diff'
+              echo '````diff'; cat "$root/profile.diff"; echo; echo '````'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
